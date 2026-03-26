@@ -6,7 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -15,9 +15,6 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
 APP_TITLE = "KrispCall Deals Recovery Analyzer"
 KTM = ZoneInfo("Asia/Kathmandu")
@@ -28,13 +25,6 @@ KC_DEEP = "#7C3AED"
 KC_PINK = "#E060F0"
 KC_SOFT = "#F8F2FF"
 KC_TEXT = "#1F1430"
-KC_GREEN = "#14B86A"
-KC_RED = "#E24B5B"
-
-HEADER_FILL = PatternFill("solid", fgColor="EEE2FF")
-SUBHEADER_FILL = PatternFill("solid", fgColor="F8F2FF")
-METRIC_FILL = PatternFill("solid", fgColor="F6F0FF")
-BORDER = Border(bottom=Side(style="thin", color="D8C2F7"))
 
 
 @dataclass
@@ -42,6 +32,7 @@ class PipelineResult:
     pipeline_name: str
     enriched_df: pd.DataFrame
     summary_df: pd.DataFrame
+    alt_summary_df: Optional[pd.DataFrame]
     total_deals: int
     won_deals: int
     deal_value_sum: float
@@ -63,6 +54,7 @@ def get_secret(path: List[str], default=None):
     return cur
 
 
+
 def check_required_secrets() -> List[str]:
     missing = []
     required = [
@@ -78,12 +70,13 @@ def check_required_secrets() -> List[str]:
     return missing
 
 
+
 def inject_css() -> None:
     st.markdown(
         f"""
         <style>
           .stApp {{ background: linear-gradient(180deg, #ffffff 0%, #fcf9ff 100%); color: {KC_TEXT}; }}
-          .block-container {{ padding-top: 1rem; padding-bottom: 1.25rem; max-width: 1280px; }}
+          .block-container {{ padding-top: 0.9rem; padding-bottom: 1.2rem; max-width: 1280px; }}
           .kc-hero {{
             border-radius: 22px;
             padding: 20px 22px;
@@ -113,6 +106,7 @@ def inject_css() -> None:
             margin-bottom: 8px;
           }}
           .kc-note {{ font-size: 0.9rem; color: rgba(31, 20, 48, 0.78); }}
+          .kc-rule {{ height: 0; border: 0; border-top: 3px solid rgba(176, 78, 240, 0.42); margin: 18px 0 14px 0; }}
           div.stButton > button, div.stDownloadButton > button {{
             border-radius: 14px !important;
             border: 0 !important;
@@ -152,12 +146,18 @@ def inject_css() -> None:
     )
 
 
+
 def logo_html(width_px: int = 245) -> str:
-    logo_path = Path(__file__).parent / "assets" / "KrispCallLogo.png"
-    if not logo_path.exists():
-        return ""
-    b64 = base64.b64encode(logo_path.read_bytes()).decode("utf-8")
-    return f'<img src="data:image/png;base64,{b64}" style="width:{width_px}px;height:auto;"/>'
+    local_paths = [
+        Path(__file__).parent / "assets" / "KrispCallLogo.png",
+        Path(__file__).parent / "KrispCallLogo.png",
+    ]
+    for logo_path in local_paths:
+        if logo_path.exists():
+            b64 = base64.b64encode(logo_path.read_bytes()).decode("utf-8")
+            return f'<img src="data:image/png;base64,{b64}" style="width:{width_px}px;height:auto;"/>'
+    return ""
+
 
 
 def require_login() -> None:
@@ -209,6 +209,7 @@ def pick_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
     return None
 
 
+
 def extract_first_email(value) -> Optional[str]:
     if value is None:
         return None
@@ -223,18 +224,13 @@ def extract_first_email(value) -> Optional[str]:
     return matches[0].strip().lower()
 
 
-def normalize_email(email: Optional[str]) -> Optional[str]:
-    if email is None:
-        return None
-    found = extract_first_email(email)
-    return found if found else None
-
 
 def parse_deal_created(series: pd.Series) -> pd.Series:
     parsed = pd.to_datetime(series, errors="coerce")
     if getattr(parsed.dt, "tz", None) is not None:
         return parsed.dt.tz_convert(KTM).dt.tz_localize(None)
     return parsed
+
 
 
 def epoch_series_to_nepal_naive(series: pd.Series) -> pd.Series:
@@ -248,13 +244,16 @@ def epoch_series_to_nepal_naive(series: pd.Series) -> pd.Series:
     return parsed.dt.tz_convert(KTM).dt.tz_localize(None)
 
 
+
 def money_or_zero(value) -> float:
     num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     return 0.0 if pd.isna(num) else float(num)
 
 
+
 def safe_copy(df: pd.DataFrame) -> pd.DataFrame:
     return df.copy() if df is not None else pd.DataFrame()
+
 
 
 def canonical_pipeline(value) -> Optional[str]:
@@ -270,8 +269,10 @@ def canonical_pipeline(value) -> Optional[str]:
     return None
 
 
+
 def format_money(value: float) -> str:
     return f"{value:,.2f}"
+
 
 
 def read_uploaded_table(uploaded_file) -> pd.DataFrame:
@@ -340,6 +341,7 @@ def fetch_mixpanel_export(
     return raw
 
 
+
 def dedupe_mixpanel_export(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     if df.empty:
         return df.copy(), 0
@@ -359,6 +361,7 @@ def dedupe_mixpanel_export(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     return work, before - len(work)
 
 
+
 def prep_payment_df(df: pd.DataFrame) -> pd.DataFrame:
     work = safe_copy(df)
     if work.empty:
@@ -373,6 +376,7 @@ def prep_payment_df(df: pd.DataFrame) -> pd.DataFrame:
     work = work[work["email"].notna()].copy()
     work = work.sort_values(["email", "event_time_npt"], kind="mergesort")
     return work
+
 
 
 def prep_refund_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -403,6 +407,7 @@ def standardize_deals(deals_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, s
     owner_col = pick_col(work, ["Deal - Owner", "Deal Owner", "Owner"])
     pipeline_col = pick_col(work, ["Deal - Pipeline", "Deal Pipeline", "Pipeline"])
     status_col = pick_col(work, ["Deal - Status", "Deal Status", "Status"])
+    raw_deal_value_col = pick_col(work, ["Deal - Deal value", "Deal Value", "Deal - Value"])
 
     missing = {
         "Deal - Deal created on": created_col,
@@ -420,6 +425,7 @@ def standardize_deals(deals_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, s
     work["Pipeline_Group"] = work[pipeline_col].apply(canonical_pipeline)
     work["Deal_Owner"] = work[owner_col].astype(str).str.strip()
     work["Deal_Status_Normalized"] = work[status_col].astype(str).str.strip() if status_col else ""
+    work["Raw_Deal_Value"] = pd.to_numeric(work[raw_deal_value_col], errors="coerce") if raw_deal_value_col else pd.NA
 
     mapping = {
         "created_col": created_col,
@@ -428,8 +434,10 @@ def standardize_deals(deals_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, s
         "owner_col": owner_col,
         "pipeline_col": pipeline_col,
         "status_col": status_col or "",
+        "raw_deal_value_col": raw_deal_value_col or "",
     }
     return work, mapping
+
 
 
 def dedupe_pipeline(df: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
@@ -445,10 +453,12 @@ def dedupe_pipeline(df: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
     return deduped, before, len(deduped)
 
 
+
 def build_event_maps(payments_df: pd.DataFrame, refunds_df: pd.DataFrame) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     pay_map = {email: grp.sort_values("event_time_npt", kind="mergesort").reset_index(drop=True) for email, grp in payments_df.groupby("email", sort=False)} if not payments_df.empty else {}
     refund_map = {email: grp.sort_values("event_time_npt", kind="mergesort").reset_index(drop=True) for email, grp in refunds_df.groupby("email", sort=False)} if not refunds_df.empty else {}
     return pay_map, refund_map
+
 
 
 def enrich_pipeline(df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], refund_map: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -500,28 +510,57 @@ def enrich_pipeline(df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], refund_m
     return enriched
 
 
-def build_summary(enriched_df: pd.DataFrame) -> pd.DataFrame:
-    if enriched_df.empty:
-        return pd.DataFrame(columns=["Deal_Owner", "Won_Count", "Deal_Value", "Refund_Value", "Net_Value"])
 
-    summary = (
-        enriched_df.groupby("Deal_Owner", dropna=False)
+def build_summary(enriched_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Deal_Owner", "Attempted_Count", "Won_Count", "Won_%", "Deal_Value", "Refund_Value", "Net_Value"]
+    if enriched_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    work = enriched_df.copy()
+    grouped = (
+        work.groupby("Deal_Owner", dropna=False)
         .agg(
+            Attempted_Count=("Unified_Email", "size"),
             Won_Count=("Won", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
             Deal_Value=("Deal_Value", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
             Refund_Value=("Refund_Value", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
             Net_Value=("Net_Value", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
         )
         .reset_index()
-        .sort_values(["Net_Value", "Won_Count"], ascending=[False, False], kind="mergesort")
     )
-    return summary
+    grouped["Won_%"] = (grouped["Won_Count"] / grouped["Attempted_Count"].replace(0, pd.NA) * 100).fillna(0.0)
+    grouped = grouped[cols].sort_values(["Net_Value", "Won_Count"], ascending=[False, False], kind="mergesort")
+    return grouped
+
+
+
+def build_cancelled_status_summary(enriched_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Deal_Owner", "Attempted_Count", "Won_Count", "Won_%", "Deal_Value"]
+    if enriched_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    work = enriched_df.copy()
+    status_won = work["Deal_Status_Normalized"].astype(str).str.strip().str.lower().eq("won")
+    grouped = (
+        work.groupby("Deal_Owner", dropna=False)
+        .agg(
+            Attempted_Count=("Unified_Email", "size"),
+            Won_Count=("Deal_Status_Normalized", lambda s: int(s.astype(str).str.strip().str.lower().eq("won").sum())),
+            Deal_Value=("Raw_Deal_Value", lambda s: float(pd.to_numeric(s.where(status_won.loc[s.index]), errors="coerce").fillna(0).sum())),
+        )
+        .reset_index()
+    )
+    grouped["Won_%"] = (grouped["Won_Count"] / grouped["Attempted_Count"].replace(0, pd.NA) * 100).fillna(0.0)
+    grouped = grouped[cols].sort_values(["Deal_Value", "Won_Count"], ascending=[False, False], kind="mergesort")
+    return grouped
+
 
 
 def pipeline_result(name: str, source_df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], refund_map: Dict[str, pd.DataFrame]) -> PipelineResult:
     deduped, before, after = dedupe_pipeline(source_df)
     enriched = enrich_pipeline(deduped, pay_map, refund_map)
     summary = build_summary(enriched)
+    alt_summary = build_cancelled_status_summary(enriched) if name == "Cancelled" else None
     won_count = int(enriched["Won"].fillna(False).astype(bool).sum()) if not enriched.empty else 0
     deal_sum = float(pd.to_numeric(enriched.get("Deal_Value", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not enriched.empty else 0.0
     refund_sum = float(pd.to_numeric(enriched.get("Refund_Value", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not enriched.empty else 0.0
@@ -530,6 +569,7 @@ def pipeline_result(name: str, source_df: pd.DataFrame, pay_map: Dict[str, pd.Da
         pipeline_name=name,
         enriched_df=enriched,
         summary_df=summary,
+        alt_summary_df=alt_summary,
         total_deals=len(enriched),
         won_deals=won_count,
         deal_value_sum=deal_sum,
@@ -538,6 +578,7 @@ def pipeline_result(name: str, source_df: pd.DataFrame, pay_map: Dict[str, pd.Da
         deduped_from=before,
         deduped_to=after,
     )
+
 
 
 def run_analysis(
@@ -570,22 +611,22 @@ def run_analysis(
 
     logs.append(f"Cancelled dedupe kept {cancelled.deduped_to:,} of {cancelled.deduped_from:,} rows")
     logs.append(f"Expired dedupe kept {expired.deduped_to:,} of {expired.deduped_from:,} rows")
-    logs.append(
-        "Refunds are counted only for won deals, using refunds that happened within 15 days after the deal creation timestamp in Nepal time."
-    )
-    logs.append(
-        f"Detected columns. Created: {mapping['created_col']}, Owner: {mapping['owner_col']}, Pipeline: {mapping['pipeline_col']}"
-    )
+    logs.append("Refunds are counted only for won deals, using refunds that happened within 15 days after the deal creation timestamp in Nepal time.")
+    logs.append("Summary tables now include Attempted Count, Won Count, Won %, Deal Value, Refund Value, and Net Value.")
+    logs.append("Cancelled pipeline also includes a second summary based only on Deal - Status == Won and Deal - Deal value, ignoring Mixpanel.")
+    logs.append(f"Detected columns. Created: {mapping['created_col']}, Owner: {mapping['owner_col']}, Pipeline: {mapping['pipeline_col']}")
     if mapping.get("email_col"):
         logs.append(f"Primary email column used: {mapping['email_col']}")
     if mapping.get("title_col"):
         logs.append(f"Fallback title column used for email extraction: {mapping['title_col']}")
+    if mapping.get("raw_deal_value_col"):
+        logs.append(f"Cancelled alternate summary uses raw deal value column: {mapping['raw_deal_value_col']}")
 
     return cancelled, expired, logs
 
 
 # -----------------------------
-# Excel export
+# Excel export with XlsxWriter
 # -----------------------------
 def display_columns(enriched_df: pd.DataFrame) -> List[str]:
     preferred = [
@@ -594,6 +635,7 @@ def display_columns(enriched_df: pd.DataFrame) -> List[str]:
         "Deal_Owner",
         "Pipeline_Group",
         "Deal_Status_Normalized",
+        "Raw_Deal_Value",
         "Deal_Value",
         "Refund_Value",
         "Won",
@@ -602,93 +644,75 @@ def display_columns(enriched_df: pd.DataFrame) -> List[str]:
         "First_Payment_Description",
     ]
     keep = [c for c in preferred if c in enriched_df.columns]
-    other_core = [
-        c for c in [
-            "Person_Email_Extracted",
-            "Deal_Title_Email_Extracted",
-        ] if c in enriched_df.columns and c not in keep
-    ]
-    passthrough = [c for c in enriched_df.columns if c not in keep + other_core]
-    return keep + other_core + passthrough
+    passthrough = [c for c in enriched_df.columns if c not in keep]
+    return keep + passthrough
 
-
-def format_sheet(ws) -> None:
-    ws.freeze_panes = "A2"
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="4C1D95")
-        cell.fill = HEADER_FILL
-        cell.border = BORDER
-        cell.alignment = Alignment(vertical="center", horizontal="center")
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            if isinstance(cell.value, (datetime, pd.Timestamp)):
-                cell.number_format = "yyyy-mm-dd hh:mm:ss"
-            elif isinstance(cell.value, date):
-                cell.number_format = "yyyy-mm-dd"
-    for col_cells in ws.columns:
-        max_len = 0
-        for cell in col_cells[:300]:
-            value = "" if cell.value is None else str(cell.value)
-            max_len = max(max_len, len(value))
-        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max(12, max_len + 2), 38)
-
-
-def append_df(ws, df: pd.DataFrame) -> None:
-    if df.empty:
-        ws.append(["No data"])
-        return
-    ws.append(list(df.columns))
-    for row in df.itertuples(index=False):
-        values = []
-        for value in row:
-            if isinstance(value, pd.Timestamp):
-                value = value.to_pydatetime()
-            elif pd.isna(value):
-                value = None
-            values.append(value)
-        ws.append(values)
-    format_sheet(ws)
 
 
 def summary_with_total(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    total = {
-        "Deal_Owner": "TOTAL",
-        "Won_Count": int(pd.to_numeric(df["Won_Count"], errors="coerce").fillna(0).sum()),
-        "Deal_Value": float(pd.to_numeric(df["Deal_Value"], errors="coerce").fillna(0).sum()),
-        "Refund_Value": float(pd.to_numeric(df["Refund_Value"], errors="coerce").fillna(0).sum()),
-        "Net_Value": float(pd.to_numeric(df["Net_Value"], errors="coerce").fillna(0).sum()),
-    }
+    total = {df.columns[0]: "TOTAL"}
+    for col in df.columns[1:]:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            total[col] = float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+        else:
+            total[col] = ""
     return pd.concat([df, pd.DataFrame([total])], ignore_index=True)
 
 
-def build_workbook(cancelled: PipelineResult, expired: PipelineResult, logs: List[str]) -> bytes:
-    wb = Workbook()
-    default = wb.active
-    wb.remove(default)
 
-    cancel_enriched_ws = wb.create_sheet("Cancelled_Enriched")
-    append_df(cancel_enriched_ws, cancelled.enriched_df[display_columns(cancelled.enriched_df)] if not cancelled.enriched_df.empty else cancelled.enriched_df)
+def write_sheet(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame) -> None:
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    out.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    expired_enriched_ws = wb.create_sheet("Expired_Enriched")
-    append_df(expired_enriched_ws, expired.enriched_df[display_columns(expired.enriched_df)] if not expired.enriched_df.empty else expired.enriched_df)
+    workbook = writer.book
+    worksheet = writer.sheets[sheet_name]
+    header_fmt = workbook.add_format({
+        "bold": True,
+        "font_color": "#4C1D95",
+        "bg_color": "#EEE2FF",
+        "border": 1,
+        "align": "center",
+        "valign": "vcenter",
+    })
+    total_fmt = workbook.add_format({
+        "bold": True,
+        "bg_color": "#F8F2FF",
+        "border": 1,
+    })
+    money_fmt = workbook.add_format({"num_format": "#,##0.00"})
+    percent_fmt = workbook.add_format({"num_format": "0.00"})
 
-    cancel_summary_ws = wb.create_sheet("Cancelled_Summary")
-    append_df(cancel_summary_ws, summary_with_total(cancelled.summary_df))
+    for idx, col_name in enumerate(out.columns):
+        worksheet.write(0, idx, col_name, header_fmt)
+        series_as_str = out[col_name].astype(str).fillna("")
+        max_len = max([len(str(col_name))] + [len(v) for v in series_as_str.head(500).tolist()])
+        worksheet.set_column(idx, idx, min(max(12, max_len + 2), 38))
+        if col_name in {"Deal_Value", "Refund_Value", "Net_Value", "Raw_Deal_Value"}:
+            worksheet.set_column(idx, idx, min(max(12, max_len + 2), 18), money_fmt)
+        if col_name == "Won_%":
+            worksheet.set_column(idx, idx, min(max(12, max_len + 2), 14), percent_fmt)
 
-    expired_summary_ws = wb.create_sheet("Expired_Summary")
-    append_df(expired_summary_ws, summary_with_total(expired.summary_df))
+    worksheet.freeze_panes(1, 0)
+    if not out.empty and str(out.iloc[-1, 0]).strip().upper() == "TOTAL":
+        last_row = len(out)
+        worksheet.set_row(last_row, None, total_fmt)
 
-    for ws in [cancel_summary_ws, expired_summary_ws]:
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            if str(row[0].value).strip().upper() == "TOTAL":
-                for cell in row:
-                    cell.font = Font(bold=True)
-                    cell.fill = SUBHEADER_FILL
 
+
+def build_workbook(cancelled: PipelineResult, expired: PipelineResult) -> bytes:
     out = BytesIO()
-    wb.save(out)
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        write_sheet(writer, "Cancelled_Enriched", cancelled.enriched_df[display_columns(cancelled.enriched_df)] if not cancelled.enriched_df.empty else cancelled.enriched_df)
+        write_sheet(writer, "Expired_Enriched", expired.enriched_df[display_columns(expired.enriched_df)] if not expired.enriched_df.empty else expired.enriched_df)
+        write_sheet(writer, "Cancelled_Summary", summary_with_total(cancelled.summary_df))
+        if cancelled.alt_summary_df is not None:
+            write_sheet(writer, "Cancelled_Status_Summary", summary_with_total(cancelled.alt_summary_df))
+        write_sheet(writer, "Expired_Summary", summary_with_total(expired.summary_df))
     return out.getvalue()
 
 
@@ -703,9 +727,11 @@ def render_metric_row(result: PipelineResult) -> None:
     c4.metric(f"{result.pipeline_name} net value", format_money(result.net_value_sum))
 
 
+
 def render_pipeline_tab(result: PipelineResult) -> None:
     st.markdown(
         f'<div class="kc-panel"><div class="kc-chip">Deduped {result.deduped_from:,} → {result.deduped_to:,}</div>'
+        f'<div class="kc-chip">Attempted leads: {result.total_deals:,}</div>'
         f'<div class="kc-chip">Won deals: {result.won_deals:,}</div>'
         f'<div class="kc-chip">Refund total: {format_money(result.refund_value_sum)}</div></div>',
         unsafe_allow_html=True,
@@ -714,6 +740,11 @@ def render_pipeline_tab(result: PipelineResult) -> None:
     st.dataframe(result.enriched_df[display_columns(result.enriched_df)] if not result.enriched_df.empty else result.enriched_df, use_container_width=True, hide_index=True)
     st.markdown("#### Summary by Deal Owner")
     st.dataframe(summary_with_total(result.summary_df), use_container_width=True, hide_index=True)
+    if result.pipeline_name == "Cancelled" and result.alt_summary_df is not None:
+        st.markdown("#### Cancelled pipeline status summary")
+        st.caption("Uses Deal - Status = Won and Deal - Deal value only. Mixpanel is ignored in this table.")
+        st.dataframe(summary_with_total(result.alt_summary_df), use_container_width=True, hide_index=True)
+
 
 
 def main() -> None:
@@ -721,7 +752,6 @@ def main() -> None:
     require_login()
     inject_css()
 
-    st.markdown('<div style="height: 4px;"></div>', unsafe_allow_html=True)
     left, right = st.columns([1, 2.6], vertical_alignment="center")
     with left:
         st.markdown(logo_html(260), unsafe_allow_html=True)
@@ -746,12 +776,16 @@ def main() -> None:
         st.markdown("### Logic")
         st.markdown('<div class="kc-note">Email unification uses <strong>Person - Email</strong> first, then extracts email from <strong>Deal Title</strong> if needed.</div>', unsafe_allow_html=True)
         st.markdown('<div class="kc-note">Each pipeline is deduped by unified email. Current rule keeps the earliest deal created timestamp per email inside that pipeline.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note">Deal Value is the first payment after deal creation. Refund Value is the sum of refunds within 15 days after deal creation, only when the deal is won.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Main summaries use Mixpanel. Deal Value is the first payment after deal creation. Refund Value is the sum of refunds within 15 days after deal creation, only when the deal is won.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Cancelled has an extra summary that ignores Mixpanel and uses only <strong>Deal - Status</strong> and <strong>Deal - Deal value</strong>.</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="kc-panel">', unsafe_allow_html=True)
-    deals_file = st.file_uploader("Upload deals file", type=["csv", "xlsx", "xls"], help="Deals file is the primary input. Mixpanel events are fetched automatically.")
+    st.markdown('<hr class="kc-rule">', unsafe_allow_html=True)
+    deals_file = st.file_uploader(
+        "Upload deals file",
+        type=["csv", "xlsx", "xls"],
+        help="Deals file is the primary input. Mixpanel events are fetched automatically.",
+    )
     run = st.button("Run analysis", type="primary", disabled=deals_file is None)
-    st.markdown('</div>', unsafe_allow_html=True)
 
     if not run:
         return
@@ -788,7 +822,7 @@ def main() -> None:
         logs.insert(2, f"Mixpanel date range used: {from_date.isoformat()} to {to_date.isoformat()}")
         progress.progress(85, text="Enrichment complete")
 
-        workbook_bytes = build_workbook(cancelled, expired, logs)
+        workbook_bytes = build_workbook(cancelled, expired)
         filename = f"krispcall_deals_recovery_{from_date.isoformat()}_{to_date.isoformat()}.xlsx"
         progress.progress(100, text="Ready")
         status.success("Analysis complete.")
@@ -812,7 +846,7 @@ def main() -> None:
         render_metric_row(cancelled)
         render_metric_row(expired)
         st.markdown(
-            '<div class="kc-panel"><span class="kc-chip">Cancelled summary tab included</span><span class="kc-chip">Expired summary tab included</span><span class="kc-chip">Run log included in export</span></div>',
+            '<div class="kc-panel"><span class="kc-chip">Cancelled summary tab included</span><span class="kc-chip">Cancelled status summary included</span><span class="kc-chip">Expired summary tab included</span></div>',
             unsafe_allow_html=True,
         )
 
@@ -832,7 +866,7 @@ def main() -> None:
         )
         st.markdown("#### Included sheets")
         st.markdown(
-            '<div class="kc-panel"><span class="kc-chip">Cancelled_Enriched</span><span class="kc-chip">Expired_Enriched</span><span class="kc-chip">Cancelled_Summary</span><span class="kc-chip">Expired_Summary</span></div>',
+            '<div class="kc-panel"><span class="kc-chip">Cancelled_Enriched</span><span class="kc-chip">Expired_Enriched</span><span class="kc-chip">Cancelled_Summary</span><span class="kc-chip">Cancelled_Status_Summary</span><span class="kc-chip">Expired_Summary</span></div>',
             unsafe_allow_html=True,
         )
 
