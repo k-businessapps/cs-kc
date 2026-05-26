@@ -6,7 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -16,7 +16,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_TITLE = "KrispCall Customer Success Deals Analyzer"
+APP_TITLE = "KrispCall Subscription CS Effectiveness Analyzer"
 KTM = ZoneInfo("Asia/Kathmandu")
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
 
@@ -47,15 +47,24 @@ class PipelineResult:
     kind: str
     enriched_df: pd.DataFrame
     summary_df: pd.DataFrame
+    # All counts/sums below are computed against the Deal Month logic:
+    #   total_deals          = deals deduped AND created in Deal Month (A)
+    #   connected_deals      = subset of A with Connected == True
+    #   won_first_payment_*  = wins whose first qualifying payment occurred in Deal Month (E)
+    #   won_status_*         = wins whose Deal Status == Won AND closed in Deal Month (G)
+    #   *_denominator        = A + (deals NOT in A but won-this-month for that metric)
     total_deals: int
     connected_deals: int
     won_first_payment_count: int
     won_status_count: int
+    won_first_payment_denominator: int
+    won_status_denominator: int
     revenue_risk_sum: float
     revenue_recovered_first_payment_sum: float
     revenue_recovered_status_sum: float
     deduped_from: int
     deduped_to: int
+    closed_date_missing_won_count: int = 0
 
 
 # -----------------------------
@@ -188,7 +197,7 @@ def require_login() -> None:
         st.markdown(logo_html(280), unsafe_allow_html=True)
     with right:
         st.markdown(
-            '<div class="kc-hero"><h1>KrispCall Secure Access</h1><p>Login required before viewing the deal recovery dashboard.</p></div>',
+            '<div class="kc-hero"><h1>KrispCall Secure Access</h1><p>Login required before viewing the subscription deal effectiveness dashboard.</p></div>',
             unsafe_allow_html=True,
         )
 
@@ -233,6 +242,17 @@ def extract_first_email(value) -> Optional[str]:
     if not matches:
         return None
     return matches[0].strip().lower()
+
+
+def current_month_bounds(anchor: date) -> Tuple[date, date]:
+    """Return (first_day, last_day) of the calendar month containing `anchor`."""
+    first_day = anchor.replace(day=1)
+    if first_day.month == 12:
+        next_first = first_day.replace(year=first_day.year + 1, month=1)
+    else:
+        next_first = first_day.replace(month=first_day.month + 1)
+    last_day = next_first - timedelta(days=1)
+    return first_day, last_day
 
 
 def parse_datetime_to_nepal_naive(series: pd.Series) -> pd.Series:
@@ -516,17 +536,113 @@ def standardize_deals(deals_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, s
     return work, mapping
 
 
-def dedupe_pipeline(df: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
-    if df.empty:
-        return df.copy(), 0, 0
-    before = len(df)
-    deduped = (
-        df[df["Unified_Email"].notna()].copy()
-        .sort_values(["Pipeline_Group", "Unified_Email", "Deal_Created_NPT"], kind="mergesort")
-        .drop_duplicates(subset=["Pipeline_Group", "Unified_Email"], keep="first")
-        .copy()
+def dedupe_by_priority(
+    enriched_df: pd.DataFrame,
+    deal_month_start: date,
+    deal_month_end: date,
+) -> Tuple[pd.DataFrame, int, int]:
+    """Within each (Pipeline_Group, Unified_Email) group, keep the single best row by:
+       1. Owner is NOT 'Pipedrive Krispcall'
+       2. Connected == True
+       3. Deal Status == Won
+       4. First_Payment_Amount > 0
+       5. Deal created within Deal Month
+       6. Earliest Deal_Created_NPT (final tiebreaker)
+    Operates on the enriched DataFrame (after enrich_pipeline) so the priority
+    cascade can see First_Payment_Amount."""
+    if enriched_df.empty:
+        return enriched_df.copy(), 0, 0
+
+    work = enriched_df[enriched_df["Unified_Email"].notna()].copy()
+    before = len(work)
+    if work.empty:
+        return work, before, 0
+
+    month_start_ts = pd.Timestamp(deal_month_start)
+    month_end_ts = pd.Timestamp(deal_month_end) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+    owner_norm = work["Deal_Owner"].apply(normalize_owner)
+    status_norm = work["Deal_Status_Normalized"].astype(str).str.strip().str.lower()
+    first_payment_numeric = pd.to_numeric(work.get("First_Payment_Amount"), errors="coerce").fillna(0.0)
+    created_dt = pd.to_datetime(work["Deal_Created_NPT"], errors="coerce")
+
+    work["_p1_not_pipedrive"] = (owner_norm != EXCLUDED_SUMMARY_OWNER_NORMALIZED).astype(int)
+    work["_p2_connected"] = work["Connected"].fillna(False).astype(bool).astype(int)
+    work["_p3_won_status"] = (status_norm == "won").astype(int)
+    work["_p4_has_positive_fp"] = (first_payment_numeric > 0).astype(int)
+    work["_p5_in_deal_month"] = (
+        created_dt.notna() & (created_dt >= month_start_ts) & (created_dt <= month_end_ts)
+    ).astype(int)
+    # Created date: ascending = better (earliest wins as final tiebreaker).
+    # Use a fillna of far-future so NaT rows lose to dated rows.
+    work["_p6_created_for_sort"] = created_dt.fillna(pd.Timestamp.max)
+
+    work = work.sort_values(
+        by=[
+            "Pipeline_Group",
+            "Unified_Email",
+            "_p1_not_pipedrive",
+            "_p2_connected",
+            "_p3_won_status",
+            "_p4_has_positive_fp",
+            "_p5_in_deal_month",
+            "_p6_created_for_sort",
+        ],
+        ascending=[True, True, False, False, False, False, False, True],
+        kind="mergesort",
+    )
+    deduped = work.drop_duplicates(
+        subset=["Pipeline_Group", "Unified_Email"], keep="first"
+    ).copy()
+    deduped = deduped.drop(
+        columns=[
+            "_p1_not_pipedrive",
+            "_p2_connected",
+            "_p3_won_status",
+            "_p4_has_positive_fp",
+            "_p5_in_deal_month",
+            "_p6_created_for_sort",
+        ],
+        errors="ignore",
     )
     return deduped, before, len(deduped)
+
+
+def annotate_month_buckets(
+    enriched_df: pd.DataFrame,
+    deal_month_start: date,
+    deal_month_end: date,
+) -> pd.DataFrame:
+    """Tag each deduped enriched row with boolean buckets:
+       In_Deal_Month        — Deal_Created_NPT falls inside Deal Month.
+       Won_FP_This_Month    — has_first_payment AND First_Payment_Time_NPT in Deal Month.
+       Won_DS_This_Month    — Deal_Status == Won AND Deal_Closed_NPT in Deal Month."""
+    if enriched_df.empty:
+        return enriched_df.copy()
+
+    out = enriched_df.copy()
+    month_start_ts = pd.Timestamp(deal_month_start)
+    month_end_ts = pd.Timestamp(deal_month_end) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+    created = pd.to_datetime(out["Deal_Created_NPT"], errors="coerce")
+    closed = pd.to_datetime(out.get("Deal_Closed_NPT"), errors="coerce") if "Deal_Closed_NPT" in out.columns else pd.Series(pd.NaT, index=out.index)
+    fp_time = pd.to_datetime(out.get("First_Payment_Time_NPT"), errors="coerce") if "First_Payment_Time_NPT" in out.columns else pd.Series(pd.NaT, index=out.index)
+
+    out["In_Deal_Month"] = (created.notna() & (created >= month_start_ts) & (created <= month_end_ts))
+    status_won = out["Deal_Status_Normalized"].astype(str).str.strip().str.lower() == "won"
+    out["Won_FP_This_Month"] = (
+        out.get("First_Payment_Found_After_Created", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+        & fp_time.notna()
+        & (fp_time >= month_start_ts)
+        & (fp_time <= month_end_ts)
+    )
+    out["Won_DS_This_Month"] = (
+        status_won
+        & closed.notna()
+        & (closed >= month_start_ts)
+        & (closed <= month_end_ts)
+    )
+    return out
 
 
 def build_payment_map(payments_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -584,7 +700,7 @@ def enrich_pipeline(df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], kind: st
             out["Won_First_Payment"] = bool(has_first_payment)
             out["Won_Deal_Status"] = bool(status_won)
             out["Revenue_Recovered_First_Payment"] = float(first_payment_amount) if has_first_payment else 0.0
-            out["Revenue_Recovered_Deal_Status"] = float(first_payment_amount) if status_won and has_first_payment else 0.0
+            out["Revenue_Recovered_Deal_Status"] = raw_deal_value if status_won else 0.0
         else:
             out["Won_First_Payment"] = False
             out["Won_Deal_Status"] = bool(status_won)
@@ -611,7 +727,14 @@ def enrich_pipeline(df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], kind: st
     return enriched
 
 
-def build_cancelled_summary(enriched_df: pd.DataFrame, total_deduped_deals: int) -> pd.DataFrame:
+def build_cancelled_summary(enriched_df: pd.DataFrame) -> pd.DataFrame:
+    """Cancelled summary uses Deal Month buckets:
+       A          = rows where In_Deal_Month (per owner)
+       Attempted  = |A|
+       Won        = count of A where Deal_Status == Won (literal 'as is', no close-date filter)
+       Won denom  = |A| + |prev-month rows that won-DS THIS month|
+       Revenue Risk= sum(Revenue_Risk of A) + sum(Revenue_Risk of prev-month won-DS rows)
+       Recovered  = sum(Deal_Value of A∩Won) + sum(Deal_Value of prev-month won-DS rows)"""
     cols = [
         "Owner",
         "Attempted",
@@ -627,32 +750,81 @@ def build_cancelled_summary(enriched_df: pd.DataFrame, total_deduped_deals: int)
     if enriched_df.empty:
         return pd.DataFrame(columns=cols)
 
-    denominator = total_summary_denominator(total_deduped_deals)
-    work = exclude_summary_owner(enriched_df)
+    df = enriched_df.copy()
+    df["_in_a"] = df["In_Deal_Month"].fillna(False).astype(bool)
+    df["_won_ds_this_month"] = df["Won_DS_This_Month"].fillna(False).astype(bool)
+    df["_prev_won_ds"] = (~df["_in_a"]) & df["_won_ds_this_month"]
+
+    pipeline_total_attempted = int(df["_in_a"].sum())  # includes Pipedrive Krispcall
+
+    work = exclude_summary_owner(df)
     if work.empty:
         return pd.DataFrame(columns=cols)
 
-    grouped = (
-        work.groupby("Deal_Owner", dropna=False)
-        .agg(
-            Attempted=("Unified_Email", "size"),
-            Connected=("Connected", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
-            Won=("Won_Deal_Status", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
-            Revenue_Risk=("Revenue_Risk", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
-            Revenue_Recovered=("Revenue_Recovered_Deal_Status", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
-        )
-        .reset_index()
-        .rename(columns={"Deal_Owner": "Owner", "Revenue_Risk": "Revenue Risk", "Revenue_Recovered": "Revenue Recovered"})
-    )
-    grouped["Attempted %"] = grouped.apply(lambda r: safe_pct(r["Attempted"], denominator), axis=1)
+    rev = pd.to_numeric(work["Revenue_Risk"], errors="coerce").fillna(0.0)
+    rev_recovered_ds = pd.to_numeric(work["Revenue_Recovered_Deal_Status"], errors="coerce").fillna(0.0)
+    connected = work["Connected"].fillna(False).astype(bool)
+    in_a = work["_in_a"]
+    prev_won_ds = work["_prev_won_ds"]
+    won_ds_this_month = work["_won_ds_this_month"]
+
+    grouped = pd.DataFrame({
+        "Owner": work["Deal_Owner"],
+        "Attempted": in_a.astype(int),
+        "Connected": (in_a & connected).astype(int),
+        "Won": won_ds_this_month.astype(int),           # all wins this month (A + prev)
+        "Prev_Won_DS": prev_won_ds.astype(int),         # used only for denominator
+        "Revenue Risk A": (rev * in_a.astype(int)).astype(float),
+        "Revenue Risk Prev": (rev * prev_won_ds.astype(int)).astype(float),
+        "Recovered": (rev_recovered_ds * won_ds_this_month.astype(int)).astype(float),
+    }).groupby("Owner", dropna=False).sum(numeric_only=True).reset_index()
+
+    grouped["Won_Denominator"] = grouped["Attempted"] + grouped["Prev_Won_DS"]
+    grouped["Revenue Risk"] = grouped["Revenue Risk A"] + grouped["Revenue Risk Prev"]
+    grouped["Revenue Recovered"] = grouped["Recovered"]
+
+    grouped["Attempted %"] = grouped.apply(lambda r: safe_pct(r["Attempted"], pipeline_total_attempted), axis=1)
     grouped["Connect %"] = grouped.apply(lambda r: safe_pct(r["Connected"], r["Attempted"]), axis=1)
-    grouped["Won %"] = grouped.apply(lambda r: safe_pct(r["Won"], r["Attempted"]), axis=1)
+    grouped["Won %"] = grouped.apply(lambda r: safe_pct(r["Won"], r["Won_Denominator"]), axis=1)
     grouped["Recovery %"] = grouped.apply(lambda r: safe_pct(r["Revenue Recovered"], r["Revenue Risk"]), axis=1)
+
+    # TOTAL row aggregates the visible (non-Pipedrive-Krispcall) owners.
+    total_attempted = int(grouped["Attempted"].sum())
+    total_won_denom = int(grouped["Won_Denominator"].sum())
+    total_risk = float(grouped["Revenue Risk"].sum())
+    total_recovered = float(grouped["Revenue Recovered"].sum())
+    total_won = int(grouped["Won"].sum())
+    total_connected = int(grouped["Connected"].sum())
+
     grouped = grouped[cols].sort_values(["Revenue Recovered", "Won"], ascending=[False, False], kind="mergesort")
-    return grouped
+    total_row = {c: "" for c in cols}
+    total_row["Owner"] = "TOTAL"
+    total_row["Attempted"] = total_attempted
+    total_row["Attempted %"] = safe_pct(total_attempted, pipeline_total_attempted)
+    total_row["Connected"] = total_connected
+    total_row["Connect %"] = safe_pct(total_connected, total_attempted)
+    total_row["Won"] = total_won
+    total_row["Won %"] = safe_pct(total_won, total_won_denom)
+    total_row["Revenue Risk"] = total_risk
+    total_row["Revenue Recovered"] = total_recovered
+    total_row["Recovery %"] = safe_pct(total_recovered, total_risk)
+    return pd.concat([grouped, pd.DataFrame([total_row])], ignore_index=True)
 
 
-def build_expired_summary(enriched_df: pd.DataFrame, total_deduped_deals: int) -> pd.DataFrame:
+def build_expired_summary(enriched_df: pd.DataFrame) -> pd.DataFrame:
+    """Expired summary uses Deal Month buckets:
+       A           = rows where In_Deal_Month (per owner)
+       Attempted   = |A|
+       Won-FP (E)  = ALL deduped rows whose qualifying payment occurred in Deal Month
+                     (includes prev-month deals whose payment landed this month)
+       F denom     = |A| + |prev-month rows where payment occurred THIS month|
+       Won-DS (G)  = ALL deduped rows where Deal_Status == Won AND closed in Deal Month
+       H denom     = |A| + |prev-month rows where closed THIS month with status Won|
+       Risk (I)    = sum(Revenue_Risk of A) + sum(Revenue_Risk of prev-month won-DS rows)
+       Recovered-FP= sum(Revenue_Recovered_First_Payment for Won_FP_This_Month rows)
+       Recovered-DS= sum(Revenue_Recovered_Deal_Status for Won_DS_This_Month rows)
+                     Revenue_Recovered_Deal_Status = raw_deal_value when status==Won
+                     (symmetric with Cancelled — no longer gated on has_first_payment)"""
     cols = [
         "Owner",
         "Attempted",
@@ -672,79 +844,182 @@ def build_expired_summary(enriched_df: pd.DataFrame, total_deduped_deals: int) -
     if enriched_df.empty:
         return pd.DataFrame(columns=cols)
 
-    denominator = total_summary_denominator(total_deduped_deals)
-    work = exclude_summary_owner(enriched_df)
+    df = enriched_df.copy()
+    df["_in_a"] = df["In_Deal_Month"].fillna(False).astype(bool)
+    df["_won_fp_this_month"] = df["Won_FP_This_Month"].fillna(False).astype(bool)
+    df["_won_ds_this_month"] = df["Won_DS_This_Month"].fillna(False).astype(bool)
+    # prev-month buckets: used only for denom computation
+    df["_prev_won_fp"] = (~df["_in_a"]) & df["_won_fp_this_month"]
+    df["_prev_won_ds"] = (~df["_in_a"]) & df["_won_ds_this_month"]
+
+    pipeline_total_attempted = int(df["_in_a"].sum())  # includes Pipedrive Krispcall
+
+    work = exclude_summary_owner(df)
     if work.empty:
         return pd.DataFrame(columns=cols)
 
-    grouped = (
-        work.groupby("Deal_Owner", dropna=False)
-        .agg(
-            Attempted=("Unified_Email", "size"),
-            Connected=("Connected", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
-            Won_First_Payment=("Won_First_Payment", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
-            Won_Deal_Status=("Won_Deal_Status", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
-            Revenue_Risk=("Revenue_Risk", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
-            Revenue_Recovered_First_Payment=("Revenue_Recovered_First_Payment", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
-            Revenue_Recovered_Deal_Status=("Revenue_Recovered_Deal_Status", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).sum())),
-        )
-        .reset_index()
-        .rename(
-            columns={
-                "Deal_Owner": "Owner",
-                "Won_First_Payment": "Won - First Payment",
-                "Won_Deal_Status": "Won - Deal Status",
-                "Revenue_Risk": "Revenue Risk",
-                "Revenue_Recovered_First_Payment": "Revenue Recovered - First Payment",
-                "Revenue_Recovered_Deal_Status": "Revenue Recovered - Deal Status",
-            }
-        )
-    )
-    grouped["Attempted %"] = grouped.apply(lambda r: safe_pct(r["Attempted"], denominator), axis=1)
+    rec_fp = pd.to_numeric(work["Revenue_Recovered_First_Payment"], errors="coerce").fillna(0.0)
+    rec_ds = pd.to_numeric(work["Revenue_Recovered_Deal_Status"], errors="coerce").fillna(0.0)
+    rev = pd.to_numeric(work["Revenue_Risk"], errors="coerce").fillna(0.0)
+    connected = work["Connected"].fillna(False).astype(bool)
+    in_a = work["_in_a"]
+    won_fp = work["_won_fp_this_month"]
+    won_ds = work["_won_ds_this_month"]
+    prev_won_fp = work["_prev_won_fp"]
+    prev_won_ds = work["_prev_won_ds"]
+
+    grouped = pd.DataFrame({
+        "Owner": work["Deal_Owner"],
+        "Attempted": in_a.astype(int),
+        "Connected": (in_a & connected).astype(int),
+        "Won - First Payment": won_fp.astype(int),      # all wins by FP this month
+        "Won - Deal Status": won_ds.astype(int),         # all wins by DS this month
+        "Prev_Won_FP": prev_won_fp.astype(int),         # for F_denom only
+        "Prev_Won_DS": prev_won_ds.astype(int),         # for H_denom only
+        "Risk A": (rev * in_a.astype(int)).astype(float),
+        "Risk Prev DS": (rev * prev_won_ds.astype(int)).astype(float),
+        "Rec FP": (rec_fp * won_fp.astype(int)).astype(float),
+        "Rec DS": (rec_ds * won_ds.astype(int)).astype(float),
+    }).groupby("Owner", dropna=False).sum(numeric_only=True).reset_index()
+
+    grouped["F_Denom"] = grouped["Attempted"] + grouped["Prev_Won_FP"]
+    grouped["H_Denom"] = grouped["Attempted"] + grouped["Prev_Won_DS"]
+    grouped["Revenue Risk"] = grouped["Risk A"] + grouped["Risk Prev DS"]
+    grouped["Revenue Recovered - First Payment"] = grouped["Rec FP"]
+    grouped["Revenue Recovered - Deal Status"] = grouped["Rec DS"]
+
+    grouped["Attempted %"] = grouped.apply(lambda r: safe_pct(r["Attempted"], pipeline_total_attempted), axis=1)
     grouped["Connect %"] = grouped.apply(lambda r: safe_pct(r["Connected"], r["Attempted"]), axis=1)
-    grouped["Won % - First Payment"] = grouped.apply(lambda r: safe_pct(r["Won - First Payment"], r["Attempted"]), axis=1)
-    grouped["Won % - Deal Status"] = grouped.apply(lambda r: safe_pct(r["Won - Deal Status"], r["Attempted"]), axis=1)
+    grouped["Won % - First Payment"] = grouped.apply(lambda r: safe_pct(r["Won - First Payment"], r["F_Denom"]), axis=1)
+    grouped["Won % - Deal Status"] = grouped.apply(lambda r: safe_pct(r["Won - Deal Status"], r["H_Denom"]), axis=1)
     grouped["Recovery % - First Payment"] = grouped.apply(lambda r: safe_pct(r["Revenue Recovered - First Payment"], r["Revenue Risk"]), axis=1)
     grouped["Recovery % - Deal Status"] = grouped.apply(lambda r: safe_pct(r["Revenue Recovered - Deal Status"], r["Revenue Risk"]), axis=1)
+
+    # TOTAL row aggregates the visible (non-Pipedrive-Krispcall) owners.
+    total_attempted = int(grouped["Attempted"].sum())
+    total_connected = int(grouped["Connected"].sum())
+    total_won_fp = int(grouped["Won - First Payment"].sum())
+    total_won_ds = int(grouped["Won - Deal Status"].sum())
+    total_f_denom = int(grouped["F_Denom"].sum())
+    total_h_denom = int(grouped["H_Denom"].sum())
+    total_risk = float(grouped["Revenue Risk"].sum())
+    total_rec_fp = float(grouped["Revenue Recovered - First Payment"].sum())
+    total_rec_ds = float(grouped["Revenue Recovered - Deal Status"].sum())
+
     grouped = grouped[cols].sort_values(["Revenue Recovered - First Payment", "Won - First Payment"], ascending=[False, False], kind="mergesort")
-    return grouped
+    total_row = {c: "" for c in cols}
+    total_row["Owner"] = "TOTAL"
+    total_row["Attempted"] = total_attempted
+    total_row["Attempted %"] = safe_pct(total_attempted, pipeline_total_attempted)
+    total_row["Connected"] = total_connected
+    total_row["Connect %"] = safe_pct(total_connected, total_attempted)
+    total_row["Won - First Payment"] = total_won_fp
+    total_row["Won % - First Payment"] = safe_pct(total_won_fp, total_f_denom)
+    total_row["Won - Deal Status"] = total_won_ds
+    total_row["Won % - Deal Status"] = safe_pct(total_won_ds, total_h_denom)
+    total_row["Revenue Risk"] = total_risk
+    total_row["Revenue Recovered - First Payment"] = total_rec_fp
+    total_row["Recovery % - First Payment"] = safe_pct(total_rec_fp, total_risk)
+    total_row["Revenue Recovered - Deal Status"] = total_rec_ds
+    total_row["Recovery % - Deal Status"] = safe_pct(total_rec_ds, total_risk)
+    return pd.concat([grouped, pd.DataFrame([total_row])], ignore_index=True)
 
 
-def pipeline_result(name: str, kind: str, source_df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame]) -> PipelineResult:
-    deduped, before, after = dedupe_pipeline(source_df)
-    enriched = enrich_pipeline(deduped, pay_map, kind)
-    summary = build_expired_summary(enriched, len(enriched)) if kind == "expired" else build_cancelled_summary(enriched, len(enriched))
+def pipeline_result(
+    name: str,
+    kind: str,
+    source_df: pd.DataFrame,
+    pay_map: Dict[str, pd.DataFrame],
+    deal_month_start: date,
+    deal_month_end: date,
+) -> PipelineResult:
+    # Enrich BEFORE dedupe so priority cascade can see First_Payment_Amount.
+    enriched_predupe = enrich_pipeline(source_df, pay_map, kind)
+    deduped, before, after = dedupe_by_priority(enriched_predupe, deal_month_start, deal_month_end)
+    annotated = annotate_month_buckets(deduped, deal_month_start, deal_month_end)
+    summary = build_expired_summary(annotated) if kind == "expired" else build_cancelled_summary(annotated)
 
-    total_deals = len(enriched)
-    connected_deals = int(enriched["Connected"].fillna(False).astype(bool).sum()) if not enriched.empty else 0
-    won_first_payment_count = int(enriched["Won_First_Payment"].fillna(False).astype(bool).sum()) if not enriched.empty else 0
-    won_status_count = int(enriched["Won_Deal_Status"].fillna(False).astype(bool).sum()) if not enriched.empty else 0
-    revenue_risk_sum = float(pd.to_numeric(enriched.get("Revenue_Risk", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not enriched.empty else 0.0
-    revenue_recovered_first_payment_sum = float(pd.to_numeric(enriched.get("Revenue_Recovered_First_Payment", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not enriched.empty else 0.0
-    revenue_recovered_status_sum = float(pd.to_numeric(enriched.get("Revenue_Recovered_Deal_Status", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not enriched.empty else 0.0
+    if annotated.empty:
+        return PipelineResult(
+            pipeline_name=name,
+            kind=kind,
+            enriched_df=annotated,
+            summary_df=summary,
+            total_deals=0,
+            connected_deals=0,
+            won_first_payment_count=0,
+            won_status_count=0,
+            won_first_payment_denominator=0,
+            won_status_denominator=0,
+            revenue_risk_sum=0.0,
+            revenue_recovered_first_payment_sum=0.0,
+            revenue_recovered_status_sum=0.0,
+            deduped_from=before,
+            deduped_to=after,
+            closed_date_missing_won_count=0,
+        )
+
+    in_a = annotated["In_Deal_Month"].fillna(False).astype(bool)
+    won_status = annotated["Won_Deal_Status"].fillna(False).astype(bool)
+    prev_won_fp = (~in_a) & annotated["Won_FP_This_Month"].fillna(False).astype(bool)
+    prev_won_ds = (~in_a) & annotated["Won_DS_This_Month"].fillna(False).astype(bool)
+
+    rev_risk = pd.to_numeric(annotated["Revenue_Risk"], errors="coerce").fillna(0.0)
+    rec_fp = pd.to_numeric(annotated["Revenue_Recovered_First_Payment"], errors="coerce").fillna(0.0)
+    rec_ds = pd.to_numeric(annotated["Revenue_Recovered_Deal_Status"], errors="coerce").fillna(0.0)
+    connected_mask = annotated["Connected"].fillna(False).astype(bool)
+
+    total_deals = int(in_a.sum())
+    connected_deals = int((in_a & connected_mask).sum())
+    # Numerator: ALL wins this month (A wins + prev-month wins), per the new spec.
+    won_fp_this_month = annotated["Won_FP_This_Month"].fillna(False).astype(bool)
+    won_ds_this_month = annotated["Won_DS_This_Month"].fillna(False).astype(bool)
+    f_denom = total_deals + int(prev_won_fp.sum())
+    h_denom = total_deals + int(prev_won_ds.sum())
+
+    revenue_risk_sum = float((rev_risk * (in_a | prev_won_ds).astype(int)).sum())
+    revenue_recovered_fp_sum = float((rec_fp * won_fp_this_month.astype(int)).sum())
+    revenue_recovered_ds_sum = float((rec_ds * won_ds_this_month.astype(int)).sum())
+
+    # Diagnostics: status==Won rows whose close-date is missing won't enter the
+    # 'prev_won_ds' bucket. Surface this so users notice silent drops.
+    closed_missing = 0
+    if "Deal_Closed_NPT" in annotated.columns:
+        closed_missing = int(
+            (won_status & (~in_a) & annotated["Deal_Closed_NPT"].isna()).sum()
+        )
 
     return PipelineResult(
         pipeline_name=name,
         kind=kind,
-        enriched_df=enriched,
+        enriched_df=annotated,
         summary_df=summary,
         total_deals=total_deals,
         connected_deals=connected_deals,
-        won_first_payment_count=won_first_payment_count,
-        won_status_count=won_status_count,
+        won_first_payment_count=int(won_fp_this_month.sum()),
+        won_status_count=int(won_ds_this_month.sum()),
+        won_first_payment_denominator=f_denom,
+        won_status_denominator=h_denom,
         revenue_risk_sum=revenue_risk_sum,
-        revenue_recovered_first_payment_sum=revenue_recovered_first_payment_sum,
-        revenue_recovered_status_sum=revenue_recovered_status_sum,
+        revenue_recovered_first_payment_sum=revenue_recovered_fp_sum,
+        revenue_recovered_status_sum=revenue_recovered_ds_sum,
         deduped_from=before,
         deduped_to=after,
+        closed_date_missing_won_count=closed_missing,
     )
 
 
-def run_analysis(deals_df: pd.DataFrame, payments_df: pd.DataFrame) -> Tuple[PipelineResult, PipelineResult, List[str]]:
+def run_analysis(
+    deals_df: pd.DataFrame,
+    payments_df: pd.DataFrame,
+    deal_month_start: date,
+    deal_month_end: date,
+) -> Tuple[PipelineResult, PipelineResult, List[str]]:
     logs: List[str] = []
 
     deals_std, mapping = standardize_deals(deals_df)
     logs.append(f"Deals rows loaded: {len(deals_std):,}")
+
     unified_missing = int(deals_std["Unified_Email"].isna().sum())
     if unified_missing:
         logs.append(f"Deals with no usable email from Work, Other, or Deal Title: {unified_missing:,}")
@@ -758,20 +1033,37 @@ def run_analysis(deals_df: pd.DataFrame, payments_df: pd.DataFrame) -> Tuple[Pip
     logs.append(f"Cancelled Subscriptions rows before dedupe: {len(cancelled_source):,}")
     logs.append(f"Expired Subscriptions rows before dedupe: {len(expired_source):,}")
 
-    cancelled = pipeline_result(CANCELLED_PIPELINE, "cancelled", cancelled_source, pay_map)
-    expired = pipeline_result(EXPIRED_PIPELINE, "expired", expired_source, pay_map)
+    cancelled = pipeline_result(
+        CANCELLED_PIPELINE, "cancelled", cancelled_source, pay_map, deal_month_start, deal_month_end
+    )
+    expired = pipeline_result(
+        EXPIRED_PIPELINE, "expired", expired_source, pay_map, deal_month_start, deal_month_end
+    )
 
     logs.append(f"Cancelled dedupe kept {cancelled.deduped_to:,} of {cancelled.deduped_from:,} rows")
     logs.append(f"Expired dedupe kept {expired.deduped_to:,} of {expired.deduped_from:,} rows")
-    logs.append("Deduplication is pipeline-specific: the same email can remain once in Cancelled and once in Expired, but not twice inside the same pipeline.")
-    logs.append("Owner summaries exclude Pipedrive Krispcall. Attempted % still uses the full deduped pipeline count, including Pipedrive Krispcall, as the denominator.")
+    logs.append(
+        "Dedupe priority within each Pipeline+Email: "
+        "(1) owner != Pipedrive Krispcall, (2) Connected, (3) Status Won, "
+        "(4) positive First Payment Value, (5) created in Deal Month, "
+        "(6) earliest created date."
+    )
+    logs.append(
+        f"Deal Month bucket: {deal_month_start.isoformat()} to {deal_month_end.isoformat()} (NPT). "
+        "Summaries use 'A' = deals created in this month and add prev-month deals that closed/won this month."
+    )
+    if cancelled.closed_date_missing_won_count or expired.closed_date_missing_won_count:
+        logs.append(
+            "Warning: status=Won rows outside Deal Month with missing Deal Closed date "
+            f"were skipped from prev-month buckets. Cancelled: {cancelled.closed_date_missing_won_count:,}, "
+            f"Expired: {expired.closed_date_missing_won_count:,}. Provide 'Deal - Deal closed on' to capture them."
+        )
+    logs.append("Owner summaries exclude Pipedrive Krispcall. Attempted % denominator includes Pipedrive Krispcall.")
     logs.append(f"Excluded from Cancelled owner summary: {excluded_summary_count(cancelled.enriched_df):,} Pipedrive Krispcall rows")
     logs.append(f"Excluded from Expired owner summary: {excluded_summary_count(expired.enriched_df):,} Pipedrive Krispcall rows")
     logs.append("Connected is TRUE when Deal - Reach Status or Deal - Label contains Connected, unless that same value contains Not Connected.")
-    logs.append("Expired Subscriptions has two won definitions: First qualifying subscription-indicator payment after deal creation, and Deal Status equals Won.")
-    logs.append("Expired revenue recovered uses the first Mixpanel New Payment Made amount after deal creation where Amount Description contains Agent Added, Number Purchased, Starter, Advance, or Enterprise.")
-    logs.append("Cancelled Subscriptions won logic uses Deal Status equals Won. Revenue recovered uses Deal - Value from the uploaded CSV.")
-    logs.append("Refund Granted is no longer fetched or used.")
+    logs.append("Qualifying subscription-indicator payments: Agent Added, Number Purchased, Starter, Advance, Enterprise.")
+    logs.append("Email priority for unification: Deal Title > Person - Email - Work > Person - Email - Other.")
     logs.append(f"Detected columns. Created: {mapping['created_col']}, Closed: {mapping['closed_col'] or 'not found'}, Owner: {mapping['owner_col']}, Pipeline: {mapping['pipeline_col']}")
     logs.append(f"Email columns used. Title first: {mapping['title_col'] or 'not found'}, Work fallback: {mapping['email_work_col'] or 'not found'}, Other fallback: {mapping['email_other_col'] or 'not found'}")
     logs.append(f"Connected columns used. Reach Status: {mapping['reach_col'] or 'not found'}, Label: {mapping['label_col'] or 'not found'}")
@@ -814,34 +1106,10 @@ def display_columns(enriched_df: pd.DataFrame) -> List[str]:
 
 
 def summary_with_total(df: pd.DataFrame, kind: str, total_deduped_deals: int) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    denominator = total_summary_denominator(total_deduped_deals)
-    total = {col: "" for col in df.columns}
-    total["Owner"] = "TOTAL"
-    total["Attempted"] = float(pd.to_numeric(df["Attempted"], errors="coerce").fillna(0).sum())
-    total["Attempted %"] = safe_pct(total["Attempted"], denominator)
-    total["Connected"] = float(pd.to_numeric(df["Connected"], errors="coerce").fillna(0).sum())
-    total["Connect %"] = safe_pct(total["Connected"], total["Attempted"])
-    total["Revenue Risk"] = float(pd.to_numeric(df["Revenue Risk"], errors="coerce").fillna(0).sum())
-
-    if kind == "expired":
-        total["Won - First Payment"] = float(pd.to_numeric(df["Won - First Payment"], errors="coerce").fillna(0).sum())
-        total["Won % - First Payment"] = safe_pct(total["Won - First Payment"], total["Attempted"])
-        total["Won - Deal Status"] = float(pd.to_numeric(df["Won - Deal Status"], errors="coerce").fillna(0).sum())
-        total["Won % - Deal Status"] = safe_pct(total["Won - Deal Status"], total["Attempted"])
-        total["Revenue Recovered - First Payment"] = float(pd.to_numeric(df["Revenue Recovered - First Payment"], errors="coerce").fillna(0).sum())
-        total["Recovery % - First Payment"] = safe_pct(total["Revenue Recovered - First Payment"], total["Revenue Risk"])
-        total["Revenue Recovered - Deal Status"] = float(pd.to_numeric(df["Revenue Recovered - Deal Status"], errors="coerce").fillna(0).sum())
-        total["Recovery % - Deal Status"] = safe_pct(total["Revenue Recovered - Deal Status"], total["Revenue Risk"])
-    else:
-        total["Won"] = float(pd.to_numeric(df["Won"], errors="coerce").fillna(0).sum())
-        total["Won %"] = safe_pct(total["Won"], total["Attempted"])
-        total["Revenue Recovered"] = float(pd.to_numeric(df["Revenue Recovered"], errors="coerce").fillna(0).sum())
-        total["Recovery %"] = safe_pct(total["Revenue Recovered"], total["Revenue Risk"])
-
-    return pd.concat([df, pd.DataFrame([total])], ignore_index=True)
+    # TOTAL row is now embedded by build_cancelled_summary / build_expired_summary.
+    # This passthrough is kept so callers don't need changes.
+    _ = kind, total_deduped_deals
+    return df if df is None else df.copy()
 
 
 def write_sheet(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame) -> None:
@@ -920,10 +1188,10 @@ def build_workbook(cancelled: PipelineResult, expired: PipelineResult, logs: Lis
 def render_metric_row(result: PipelineResult) -> None:
     if result.kind == "expired":
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Expired attempted", f"{result.total_deals:,}")
+        c1.metric("Expired attempted (Deal Month)", f"{result.total_deals:,}")
         c2.metric("Expired connected", f"{result.connected_deals:,}", format_percent(safe_pct(result.connected_deals, result.total_deals)))
-        c3.metric("Won by first payment", f"{result.won_first_payment_count:,}", format_percent(safe_pct(result.won_first_payment_count, result.total_deals)))
-        c4.metric("Won by deal status", f"{result.won_status_count:,}", format_percent(safe_pct(result.won_status_count, result.total_deals)))
+        c3.metric("Won by first payment", f"{result.won_first_payment_count:,}", format_percent(safe_pct(result.won_first_payment_count, result.won_first_payment_denominator)))
+        c4.metric("Won by deal status", f"{result.won_status_count:,}", format_percent(safe_pct(result.won_status_count, result.won_status_denominator)))
 
         c5, c6, c7 = st.columns(3)
         c5.metric("Expired revenue risk", format_money(result.revenue_risk_sum))
@@ -931,9 +1199,9 @@ def render_metric_row(result: PipelineResult) -> None:
         c7.metric("Recovered by deal status", format_money(result.revenue_recovered_status_sum), format_percent(safe_pct(result.revenue_recovered_status_sum, result.revenue_risk_sum)))
     else:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Cancelled attempted", f"{result.total_deals:,}")
+        c1.metric("Cancelled attempted (Deal Month)", f"{result.total_deals:,}")
         c2.metric("Cancelled connected", f"{result.connected_deals:,}", format_percent(safe_pct(result.connected_deals, result.total_deals)))
-        c3.metric("Cancelled won", f"{result.won_status_count:,}", format_percent(safe_pct(result.won_status_count, result.total_deals)))
+        c3.metric("Cancelled won", f"{result.won_status_count:,}", format_percent(safe_pct(result.won_status_count, result.won_status_denominator)))
         c4.metric("Cancelled recovered", format_money(result.revenue_recovered_status_sum), format_percent(safe_pct(result.revenue_recovered_status_sum, result.revenue_risk_sum)))
 
 
@@ -1013,8 +1281,8 @@ def main() -> None:
         st.markdown(logo_html(260), unsafe_allow_html=True)
     with right:
         st.markdown(
-            '<div class="kc-hero"><h1>KrispCall Deals Recovery Analyzer</h1>'
-            '<p>Upload the deals file. The app pulls <strong>New Payment Made</strong> from Mixpanel and builds owner-wise recovery summaries for Cancelled and Expired Subscriptions using qualifying payment descriptions.</p></div>',
+            '<div class="kc-hero"><h1>KrispCall Subscription CS Effectiveness Analyzer</h1>'
+            '<p>Upload the Pipedrive deals file. The app reviews expired and cancelled KrispCall subscription deals and shows owner-wise Customer Success effectiveness using connected, won, and recovery outcomes.</p></div>',
             unsafe_allow_html=True,
         )
 
@@ -1028,6 +1296,18 @@ def main() -> None:
             st.error("From date cannot be later than To date.")
             st.stop()
 
+        st.markdown("---")
+        st.markdown("### Current deal month")
+        deal_month_anchor = st.date_input(
+            "Pick any date in the deal month",
+            value=today.replace(day=1),
+            help="Filters deals by Deal - Deal created. Any date inside the target month works; only month and year are used.",
+            key="deal_month_anchor",
+        )
+        deal_month_start, deal_month_end = current_month_bounds(deal_month_anchor)
+        st.caption(
+            f"Analyzing deals created {deal_month_start.isoformat()} to {deal_month_end.isoformat()} (NPT)."
+        )
 
     st.markdown('<hr class="kc-rule">', unsafe_allow_html=True)
     deals_file = st.file_uploader(
@@ -1059,13 +1339,25 @@ def main() -> None:
             progress.progress(55, text="New Payment Made fetched")
 
             status.info("Processing deals, connected logic, deduplication, and summaries...")
-            cancelled, expired, logs = run_analysis(deals_df, payments_deduped)
+            cancelled, expired, logs = run_analysis(
+                deals_df,
+                payments_deduped,
+                deal_month_start=deal_month_start,
+                deal_month_end=deal_month_end,
+            )
             logs.insert(0, f"Payments dedupe removed: {payments_removed:,}")
             logs.insert(1, f"Mixpanel payment date range used: {from_date.isoformat()} to {to_date.isoformat()}")
+            logs.insert(
+                2,
+                f"Deal month used: {deal_month_start.isoformat()} to {deal_month_end.isoformat()} (NPT)",
+            )
             progress.progress(85, text="Summaries complete")
 
             workbook_bytes = build_workbook(cancelled, expired, logs)
-            filename = f"krispcall_deals_recovery_{from_date.isoformat()}_{to_date.isoformat()}.xlsx"
+            filename = (
+                f"krispcall_deals_recovery_dealmonth_{deal_month_start.isoformat()}_"
+                f"payments_{from_date.isoformat()}_{to_date.isoformat()}.xlsx"
+            )
             progress.progress(100, text="Ready")
             status.success("Analysis complete.")
 
