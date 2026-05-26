@@ -30,6 +30,16 @@ EXPIRED_PIPELINE = "Expired Subscriptions"
 CANCELLED_PIPELINE = "Cancelled Subscriptions"
 EXCLUDED_SUMMARY_OWNER_NORMALIZED = "pipedrive krispcall"
 
+# A New Payment Made event is considered eligible for recovery matching only
+# when its Amount Description contains at least one of these indicators.
+SUBSCRIPTION_PAYMENT_INDICATORS = (
+    "Agent Added",
+    "Number Purchased",
+    "Starter",
+    "Advance",
+    "Enterprise",
+)
+
 
 @dataclass
 class PipelineResult:
@@ -305,6 +315,22 @@ def normalize_owner(value) -> str:
     return str(value).strip().lower()
 
 
+def is_subscription_payment_indicator(value) -> bool:
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+
+    text = str(value).strip().lower()
+    if not text:
+        return False
+
+    return any(indicator.lower() in text for indicator in SUBSCRIPTION_PAYMENT_INDICATORS)
+
+
 def exclude_summary_owner(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "Deal_Owner" not in df.columns:
         return df.copy()
@@ -417,6 +443,7 @@ def prep_payment_df(df: pd.DataFrame) -> pd.DataFrame:
     work["email"] = work[email_col].apply(extract_first_email) if email_col else None
     work["Amount"] = pd.to_numeric(work[amount_col], errors="coerce") if amount_col else pd.NA
     work["Amount Description"] = work[desc_col].astype(str) if desc_col else ""
+    work["Payment_Is_Subscription_Indicator"] = work["Amount Description"].apply(is_subscription_payment_indicator)
     work = work[work["email"].notna()].copy()
     if "event_time_npt" in work.columns:
         work = work.sort_values(["email", "event_time_npt"], kind="mergesort")
@@ -457,7 +484,11 @@ def standardize_deals(deals_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, s
     work["Person_Email_Work_Extracted"] = work[email_work_col].apply(extract_first_email) if email_work_col else None
     work["Person_Email_Other_Extracted"] = work[email_other_col].apply(extract_first_email) if email_other_col else None
     work["Deal_Title_Email_Extracted"] = work[title_col].apply(extract_first_email) if title_col else None
-    work["Unified_Email"] = work["Person_Email_Work_Extracted"].combine_first(work["Person_Email_Other_Extracted"]).combine_first(work["Deal_Title_Email_Extracted"])
+    work["Unified_Email"] = (
+        work["Deal_Title_Email_Extracted"]
+        .combine_first(work["Person_Email_Work_Extracted"])
+        .combine_first(work["Person_Email_Other_Extracted"])
+    )
     work["Pipeline_Group"] = work[pipeline_col].apply(canonical_pipeline)
     work["Deal_Owner"] = work[owner_col].astype(str).str.strip()
     work["Deal_Status_Normalized"] = work[status_col].astype(str).str.strip()
@@ -524,7 +555,10 @@ def enrich_pipeline(df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], kind: st
 
         if pd.notna(created) and email in pay_map:
             p_df = pay_map[email]
-            p_match = p_df[p_df["event_time_npt"] > created]
+            p_match = p_df[
+                (p_df["event_time_npt"] > created)
+                & (p_df["Payment_Is_Subscription_Indicator"].fillna(False))
+            ]
             if not p_match.empty:
                 first = p_match.iloc[0]
                 first_payment_amount = money_or_zero(first.get("Amount"))
@@ -537,9 +571,14 @@ def enrich_pipeline(df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], kind: st
         out = row.to_dict()
         out["Revenue_Risk"] = raw_deal_value
         out["First_Payment_Found_After_Created"] = bool(has_first_payment)
+        out["First_Qualifying_Payment_Found_After_Created"] = bool(has_first_payment)
         out["First_Payment_Amount"] = None if pd.isna(first_payment_amount) else float(first_payment_amount)
         out["First_Payment_Time_NPT"] = first_payment_time
         out["First_Payment_Description"] = first_payment_desc
+        out["Picked_Payment_Amount_Description"] = first_payment_desc
+        out["First_Payment_Difference_vs_Deal_Value"] = (
+            float(first_payment_amount) - raw_deal_value if has_first_payment else None
+        )
 
         if kind == "expired":
             out["Won_First_Payment"] = bool(has_first_payment)
@@ -563,6 +602,7 @@ def enrich_pipeline(df: pd.DataFrame, pay_map: Dict[str, pd.DataFrame], kind: st
             "Raw_Deal_Value",
             "Revenue_Risk",
             "First_Payment_Amount",
+            "First_Payment_Difference_vs_Deal_Value",
             "Revenue_Recovered_First_Payment",
             "Revenue_Recovered_Deal_Status",
         ]:
@@ -728,12 +768,12 @@ def run_analysis(deals_df: pd.DataFrame, payments_df: pd.DataFrame) -> Tuple[Pip
     logs.append(f"Excluded from Cancelled owner summary: {excluded_summary_count(cancelled.enriched_df):,} Pipedrive Krispcall rows")
     logs.append(f"Excluded from Expired owner summary: {excluded_summary_count(expired.enriched_df):,} Pipedrive Krispcall rows")
     logs.append("Connected is TRUE when Deal - Reach Status or Deal - Label contains Connected, unless that same value contains Not Connected.")
-    logs.append("Expired Subscriptions has two won definitions: First Payment after deal creation, and Deal Status equals Won.")
-    logs.append("Expired revenue recovered uses the first Mixpanel payment amount after deal creation for each won definition.")
+    logs.append("Expired Subscriptions has two won definitions: First qualifying subscription-indicator payment after deal creation, and Deal Status equals Won.")
+    logs.append("Expired revenue recovered uses the first Mixpanel New Payment Made amount after deal creation where Amount Description contains Agent Added, Number Purchased, Starter, Advance, or Enterprise.")
     logs.append("Cancelled Subscriptions won logic uses Deal Status equals Won. Revenue recovered uses Deal - Value from the uploaded CSV.")
     logs.append("Refund Granted is no longer fetched or used.")
     logs.append(f"Detected columns. Created: {mapping['created_col']}, Closed: {mapping['closed_col'] or 'not found'}, Owner: {mapping['owner_col']}, Pipeline: {mapping['pipeline_col']}")
-    logs.append(f"Email columns used. Work: {mapping['email_work_col'] or 'not found'}, Other: {mapping['email_other_col'] or 'not found'}, Title fallback: {mapping['title_col'] or 'not found'}")
+    logs.append(f"Email columns used. Title first: {mapping['title_col'] or 'not found'}, Work fallback: {mapping['email_work_col'] or 'not found'}, Other fallback: {mapping['email_other_col'] or 'not found'}")
     logs.append(f"Connected columns used. Reach Status: {mapping['reach_col'] or 'not found'}, Label: {mapping['label_col'] or 'not found'}")
     logs.append(f"Revenue risk column used: {mapping['raw_deal_value_col']}")
 
@@ -757,9 +797,12 @@ def display_columns(enriched_df: pd.DataFrame) -> List[str]:
         "Raw_Deal_Value",
         "Revenue_Risk",
         "First_Payment_Found_After_Created",
+        "First_Qualifying_Payment_Found_After_Created",
         "First_Payment_Amount",
+        "First_Payment_Difference_vs_Deal_Value",
         "First_Payment_Time_NPT",
         "First_Payment_Description",
+        "Picked_Payment_Amount_Description",
         "Won_First_Payment",
         "Won_Deal_Status",
         "Revenue_Recovered_First_Payment",
@@ -839,6 +882,7 @@ def write_sheet(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame) -> No
             "Revenue_Risk",
             "Revenue Risk",
             "First_Payment_Amount",
+            "First_Payment_Difference_vs_Deal_Value",
             "Revenue_Recovered_First_Payment",
             "Revenue_Recovered_Deal_Status",
             "Revenue Recovered",
@@ -931,7 +975,7 @@ def render_results(payload: Dict[str, object]) -> None:
         st.markdown("### Expired Subscriptions")
         render_metric_row(expired)
         st.markdown(
-            '<div class="kc-panel"><span class="kc-chip">Refund Granted removed</span><span class="kc-chip">Connected logic added</span><span class="kc-chip">Pipeline-level dedupe</span><span class="kc-chip">Pipedrive Krispcall excluded from summaries</span><span class="kc-chip">Export persists after download</span></div>',
+            '<div class="kc-panel"><span class="kc-chip">Refund Granted removed</span><span class="kc-chip">Subscription-indicator payment matching</span><span class="kc-chip">Deal Title email priority</span><span class="kc-chip">Pipeline-level dedupe</span><span class="kc-chip">Pipedrive Krispcall excluded from summaries</span></div>',
             unsafe_allow_html=True,
         )
 
@@ -970,7 +1014,7 @@ def main() -> None:
     with right:
         st.markdown(
             '<div class="kc-hero"><h1>KrispCall Deals Recovery Analyzer</h1>'
-            '<p>Upload the deals file. The app pulls <strong>New Payment Made</strong> from Mixpanel and builds owner-wise recovery summaries for Cancelled and Expired Subscriptions.</p></div>',
+            '<p>Upload the deals file. The app pulls <strong>New Payment Made</strong> from Mixpanel and builds owner-wise recovery summaries for Cancelled and Expired Subscriptions using qualifying payment descriptions.</p></div>',
             unsafe_allow_html=True,
         )
 
@@ -986,10 +1030,11 @@ def main() -> None:
 
         st.markdown("---")
         st.markdown("### Logic")
-        st.markdown('<div class="kc-note">Email unification uses <strong>Person - Email - Work</strong>, then <strong>Person - Email - Other</strong>, then extracts from <strong>Deal Title</strong> if needed.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Email unification extracts from <strong>Deal Title</strong> first, then falls back to <strong>Person - Email - Work</strong>, then <strong>Person - Email - Other</strong>.</div>', unsafe_allow_html=True)
         st.markdown('<div class="kc-note">Deduplication is done by <strong>Pipeline + Email</strong>. Same email can remain in different pipelines, but not twice inside the same pipeline.</div>', unsafe_allow_html=True)
         st.markdown('<div class="kc-note">Connected is TRUE when <strong>Deal - Reach Status</strong> or <strong>Deal - Label</strong> contains Connected, except Not Connected.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note"><strong>Expired</strong> has two won views: first payment after deal creation, and Deal Status = Won.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note"><strong>Expired</strong> has two won views: first qualifying subscription-indicator payment after deal creation, and Deal Status = Won.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Qualifying payment descriptions contain <strong>Agent Added</strong>, <strong>Number Purchased</strong>, <strong>Starter</strong>, <strong>Advance</strong>, or <strong>Enterprise</strong>.</div>', unsafe_allow_html=True)
         st.markdown('<div class="kc-note"><strong>Cancelled</strong> uses Deal Status = Won and Deal - Value from the uploaded CSV.</div>', unsafe_allow_html=True)
         st.markdown('<div class="kc-note">Owner summaries exclude <strong>Pipedrive Krispcall</strong>. Attempted % uses the full deduped pipeline count, including Pipedrive Krispcall, as the denominator.</div>', unsafe_allow_html=True)
         st.markdown('<div class="kc-note">Refund Granted is no longer required.</div>', unsafe_allow_html=True)
