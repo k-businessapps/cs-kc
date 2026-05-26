@@ -1028,6 +1028,17 @@ def main() -> None:
             st.error("From date cannot be later than To date.")
             st.stop()
 
+        st.markdown("---")
+        st.markdown("### Logic")
+        st.markdown('<div class="kc-note">Email unification extracts from <strong>Deal Title</strong> first, then falls back to <strong>Person - Email - Work</strong>, then <strong>Person - Email - Other</strong>.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Deduplication is done by <strong>Pipeline + Email</strong>. Same email can remain in different pipelines, but not twice inside the same pipeline.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Connected is TRUE when <strong>Deal - Reach Status</strong> or <strong>Deal - Label</strong> contains Connected, except Not Connected.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note"><strong>Expired</strong> has two won views: first qualifying subscription-indicator payment after deal creation, and Deal Status = Won.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Qualifying payment descriptions contain <strong>Agent Added</strong>, <strong>Number Purchased</strong>, <strong>Starter</strong>, <strong>Advance</strong>, or <strong>Enterprise</strong>.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note"><strong>Cancelled</strong> uses Deal Status = Won and Deal - Value from the uploaded CSV.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Owner summaries exclude <strong>Pipedrive Krispcall</strong>. Attempted % uses the full deduped pipeline count, including Pipedrive Krispcall, as the denominator.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kc-note">Refund Granted is no longer required.</div>', unsafe_allow_html=True)
+
     st.markdown('<hr class="kc-rule">', unsafe_allow_html=True)
     deals_file = st.file_uploader(
         "Upload deals file",
