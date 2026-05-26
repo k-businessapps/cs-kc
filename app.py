@@ -761,22 +761,6 @@ def run_analysis(deals_df: pd.DataFrame, payments_df: pd.DataFrame) -> Tuple[Pip
     cancelled = pipeline_result(CANCELLED_PIPELINE, "cancelled", cancelled_source, pay_map)
     expired = pipeline_result(EXPIRED_PIPELINE, "expired", expired_source, pay_map)
 
-    logs.append(f"Cancelled dedupe kept {cancelled.deduped_to:,} of {cancelled.deduped_from:,} rows")
-    logs.append(f"Expired dedupe kept {expired.deduped_to:,} of {expired.deduped_from:,} rows")
-    logs.append("Deduplication is pipeline-specific: the same email can remain once in Cancelled and once in Expired, but not twice inside the same pipeline.")
-    logs.append("Owner summaries exclude Pipedrive Krispcall. Attempted % still uses the full deduped pipeline count, including Pipedrive Krispcall, as the denominator.")
-    logs.append(f"Excluded from Cancelled owner summary: {excluded_summary_count(cancelled.enriched_df):,} Pipedrive Krispcall rows")
-    logs.append(f"Excluded from Expired owner summary: {excluded_summary_count(expired.enriched_df):,} Pipedrive Krispcall rows")
-    logs.append("Connected is TRUE when Deal - Reach Status or Deal - Label contains Connected, unless that same value contains Not Connected.")
-    logs.append("Expired Subscriptions has two won definitions: First qualifying subscription-indicator payment after deal creation, and Deal Status equals Won.")
-    logs.append("Expired revenue recovered uses the first Mixpanel New Payment Made amount after deal creation where Amount Description contains Agent Added, Number Purchased, Starter, Advance, or Enterprise.")
-    logs.append("Cancelled Subscriptions won logic uses Deal Status equals Won. Revenue recovered uses Deal - Value from the uploaded CSV.")
-    logs.append("Refund Granted is no longer fetched or used.")
-    logs.append(f"Detected columns. Created: {mapping['created_col']}, Closed: {mapping['closed_col'] or 'not found'}, Owner: {mapping['owner_col']}, Pipeline: {mapping['pipeline_col']}")
-    logs.append(f"Email columns used. Title first: {mapping['title_col'] or 'not found'}, Work fallback: {mapping['email_work_col'] or 'not found'}, Other fallback: {mapping['email_other_col'] or 'not found'}")
-    logs.append(f"Connected columns used. Reach Status: {mapping['reach_col'] or 'not found'}, Label: {mapping['label_col'] or 'not found'}")
-    logs.append(f"Revenue risk column used: {mapping['raw_deal_value_col']}")
-
     return cancelled, expired, logs
 
 
@@ -1027,17 +1011,6 @@ def main() -> None:
         if from_date > to_date:
             st.error("From date cannot be later than To date.")
             st.stop()
-
-        st.markdown("---")
-        st.markdown("### Logic")
-        st.markdown('<div class="kc-note">Email unification extracts from <strong>Deal Title</strong> first, then falls back to <strong>Person - Email - Work</strong>, then <strong>Person - Email - Other</strong>.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note">Deduplication is done by <strong>Pipeline + Email</strong>. Same email can remain in different pipelines, but not twice inside the same pipeline.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note">Connected is TRUE when <strong>Deal - Reach Status</strong> or <strong>Deal - Label</strong> contains Connected, except Not Connected.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note"><strong>Expired</strong> has two won views: first qualifying subscription-indicator payment after deal creation, and Deal Status = Won.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note">Qualifying payment descriptions contain <strong>Agent Added</strong>, <strong>Number Purchased</strong>, <strong>Starter</strong>, <strong>Advance</strong>, or <strong>Enterprise</strong>.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note"><strong>Cancelled</strong> uses Deal Status = Won and Deal - Value from the uploaded CSV.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note">Owner summaries exclude <strong>Pipedrive Krispcall</strong>. Attempted % uses the full deduped pipeline count, including Pipedrive Krispcall, as the denominator.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="kc-note">Refund Granted is no longer required.</div>', unsafe_allow_html=True)
 
     st.markdown('<hr class="kc-rule">', unsafe_allow_html=True)
     deals_file = st.file_uploader(
